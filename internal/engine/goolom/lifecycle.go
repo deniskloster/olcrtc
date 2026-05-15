@@ -3,6 +3,10 @@ package goolom
 import (
 	"context"
 	"fmt"
+	"net"
+	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -10,6 +14,7 @@ import (
 	"github.com/openlibrecommunity/olcrtc/internal/engine"
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
 	"github.com/openlibrecommunity/olcrtc/internal/protect"
+	"github.com/pion/ice/v4"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -74,10 +79,70 @@ func (s *Session) waitForMediaReady(ctx context.Context, timeout time.Duration) 
 	return nil
 }
 
+// sharedICEUDPMux is the single pre-protected UDP socket Pion uses for
+// every ICE host candidate and STUN binding. Building it once and
+// reusing across the publisher and subscriber peer connections keeps
+// the NAT mapping stable, which is critical when the underlying
+// network applies CGNAT/whitelist DPI (Tele2/МТС/...).
+var (
+	sharedICEUDPMux     ice.UDPMux
+	sharedICEUDPMuxOnce sync.Once
+	sharedICEUDPMuxErr  error
+)
+
+func getOrCreateICEUDPMux() (ice.UDPMux, error) {
+	sharedICEUDPMuxOnce.Do(func() {
+		lc := &net.ListenConfig{
+			Control: func(_, _ string, c syscall.RawConn) error {
+				p := protect.Protector
+				if p == nil {
+					return nil
+				}
+				var perr error
+				if cerr := c.Control(func(fd uintptr) {
+					if !p(int(fd)) {
+						perr = fmt.Errorf("VpnService.protect failed for fd %d", fd)
+					}
+				}); cerr != nil {
+					return cerr
+				}
+				return perr
+			},
+		}
+		pc, err := lc.ListenPacket(context.Background(), "udp4", "0.0.0.0:0")
+		if err != nil {
+			sharedICEUDPMuxErr = fmt.Errorf("listen protected UDP: %w", err)
+			return
+		}
+		sharedICEUDPMux = webrtc.NewICEUDPMux(nil, pc.(*net.UDPConn))
+	})
+	return sharedICEUDPMux, sharedICEUDPMuxErr
+}
+
 func (s *Session) setupPeerConnections(config webrtc.Configuration) error {
 	settingEngine := webrtc.SettingEngine{}
 	if protect.Protector != nil {
 		settingEngine.SetICEProxyDialer(protect.NewProxyDialer())
+
+		// Pin all ICE/STUN UDP through a single pre-protected socket.
+		// On Android, otherwise Pion binds 0.0.0.0 sockets that get
+		// trapped in the app's own VpnService TUN, and NAT mapping
+		// fragments across multiple host candidates so the remote SFU
+		// can't pick one to talk back to.
+		if mux, err := getOrCreateICEUDPMux(); err == nil && mux != nil {
+			settingEngine.SetICEUDPMux(mux)
+		} else if err != nil {
+			logger.Debugf("ice udp mux unavailable: %v (continuing without it)", err)
+		}
+
+		// Exclude TUN-like interfaces so Pion doesn't gather useless
+		// 10.10.10.1 host candidates that loop through our own VPN.
+		settingEngine.SetInterfaceFilter(func(name string) bool {
+			n := strings.ToLower(name)
+			return !strings.HasPrefix(n, "tun") &&
+				!strings.HasPrefix(n, "ppp") &&
+				!strings.HasPrefix(n, "tap")
+		})
 	}
 	settingEngine.LoggerFactory = logger.NewPionLoggerFactory()
 	api := webrtc.NewAPI(webrtc.WithSettingEngine(settingEngine))
