@@ -45,7 +45,6 @@ type Peer struct {
 	mu          sync.RWMutex
 	reinstallMu sync.Mutex
 	closed      bool
-	cancel      context.CancelFunc
 	readyCh     chan struct{}
 	sessionID   string // populated after handshake
 	deviceID    string
@@ -72,20 +71,19 @@ func (p *Peer) Close() {
 		return
 	}
 	p.closed = true
+	parent := p.parent
 	p.mu.Unlock()
 	// closeSession handles session+conn nilling + onClose hook.
 	p.closeSession()
 	p.mu.Lock()
 	ln := p.Link
-	cancel := p.cancel
 	p.Link = nil
-	p.cancel = nil
 	p.mu.Unlock()
 	if ln != nil {
 		_ = ln.Close()
 	}
-	if cancel != nil {
-		cancel()
+	if parent != nil && parent.sessions != nil {
+		parent.sessions.Unregister(p.ClientID)
 	}
 }
 

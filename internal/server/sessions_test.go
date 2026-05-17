@@ -47,3 +47,17 @@ func TestSessionsConcurrent(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestSessionsUnregisterOnPeerClose(t *testing.T) {
+	s := &Server{sessions: NewSessions()}
+	p := NewPeer("client-99", []byte("01234567890123456789012345678901"))
+	p.parent = s
+	s.sessions.Register(p)
+	if s.sessions.Count() != 1 {
+		t.Fatalf("expected 1 registered, got %d", s.sessions.Count())
+	}
+	p.Close()
+	if s.sessions.Count() != 0 {
+		t.Fatalf("Peer.Close should unregister; got count=%d", s.sessions.Count())
+	}
+}
