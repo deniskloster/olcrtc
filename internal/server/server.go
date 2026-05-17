@@ -68,6 +68,14 @@ type Server struct {
 	resolver       *net.Resolver
 	socksProxyAddr string
 	socksProxyPort int
+
+	// Phase 4: per-peer state. Until Task 4.5 rewrites Start, the old
+	// singular fields above (ln, cipher, conn, session, sessMu,
+	// reinstallMu, deviceID, sessionID) are still authoritative; peers
+	// is unused.
+	peers    []*Peer
+	peersMu  sync.RWMutex
+	sessions *Sessions
 }
 
 // ConnectRequest is a message from the client to establish a new connection.
