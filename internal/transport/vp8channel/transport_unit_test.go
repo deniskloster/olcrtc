@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -305,6 +306,9 @@ func TestHandleIncomingFrameEpochFilteringAndReconnect(t *testing.T) {
 		t.Fatalf("peer state after first frame: had=%v epoch=%d", tr.hadPeer.Load(), tr.peerEpoch.Load())
 	}
 
+	// Stream-level reconnect (smux/keepalive timeout, link disconnect) still
+	// resets KCP and fires the user callback — that path is the legitimate
+	// way to recover from a real remote restart.
 	reconnected := false
 	tr.SetReconnectCallback(func() { reconnected = true })
 	stream, ok := tr.stream.(*fakeVideoStream)
@@ -318,9 +322,115 @@ func TestHandleIncomingFrameEpochFilteringAndReconnect(t *testing.T) {
 	if !reconnected || tr.kcp == nil {
 		t.Fatalf("stream reconnect did not reset/callback: reconnected=%v kcp=%v", reconnected, tr.kcp)
 	}
-	reconnected = false
-	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 2, []byte("after-restart")))
-	if !reconnected || tr.peerEpoch.Load() != 2 || tr.kcp == nil {
-		t.Fatalf("epoch change did not reset/reconnect: reconnected=%v epoch=%d kcp=%v", reconnected, tr.peerEpoch.Load(), tr.kcp) //nolint:lll // long test description
+}
+
+// TestHandleIncomingFrameFirstPeerLockIgnoresForeignEpochs verifies the
+// Telemost ghost-peer fix: once we've locked onto the first peer's epoch,
+// frames carrying any other epoch are silently dropped — they do NOT
+// trigger resetKCP and do NOT fire the reconnect callback. This is the
+// safeguard against the SFU forwarding multiple peers' tracks to us at
+// once (real server + N ghost observers), which used to produce an
+// infinite reconnect storm at the client.
+func TestHandleIncomingFrameFirstPeerLockIgnoresForeignEpochs(t *testing.T) {
+	var reconnectCalls atomic.Int32
+	tr := &streamTransport{
+		stream:       &fakeVideoStream{canSend: true},
+		outbound:     make(chan []byte, 16),
+		closeCh:      make(chan struct{}),
+		writerDone:   make(chan struct{}),
+		bindingToken: bindingToken("client"),
+		localEpoch:   0x100,
+		onData:       func([]byte) {},
+		reconnectFn:  func() { reconnectCalls.Add(1) },
+	}
+	defer func() {
+		_ = tr.Close()
+	}()
+
+	mkFrame := func(epoch uint32, payload []byte) []byte {
+		frame := make([]byte, epochHdrLen+len(payload))
+		copy(frame, vp8Keepalive)
+		binary.BigEndian.PutUint32(frame[tokenOff:epochOff], tr.bindingToken)
+		binary.BigEndian.PutUint32(frame[epochOff:crcOff], epoch)
+		binary.BigEndian.PutUint32(frame[crcOff:epochHdrLen], epochCRC(tr.bindingToken, epoch))
+		copy(frame[epochHdrLen:], payload)
+		return frame
+	}
+
+	// Pre-allocate kcp so we can detect if resetKCP would have replaced it.
+	rt, err := startKCP(tr.outbound, tr.onData, tr.epochHeader())
+	if err != nil {
+		t.Fatalf("startKCP: %v", err)
+	}
+	tr.kcpMu.Lock()
+	tr.kcp = rt
+	tr.kcpMu.Unlock()
+	originalKCP := rt
+
+	const (
+		peerA uint32 = 0xAAAA1111
+		peerB uint32 = 0xBBBB2222
+		peerC uint32 = 0xCCCC3333
+	)
+
+	// Frame 1: first peer A — should record epoch.
+	tr.handleIncomingFrame(mkFrame(peerA, nil))
+	if !tr.hadPeer.Load() {
+		t.Fatal("first peer frame did not mark hadPeer")
+	}
+	if got := tr.peerEpoch.Load(); got != peerA {
+		t.Fatalf("peer epoch after first frame: got 0x%08x want 0x%08x", got, peerA)
+	}
+	if got := reconnectCalls.Load(); got != 0 {
+		t.Fatalf("reconnect fired on first peer frame: got %d want 0", got)
+	}
+
+	// Frame 2: foreign peer B (ghost) — should be silently dropped.
+	tr.handleIncomingFrame(mkFrame(peerB, []byte("ghost")))
+	if got := tr.peerEpoch.Load(); got != peerA {
+		t.Fatalf("foreign peer B mutated locked epoch: got 0x%08x want 0x%08x", got, peerA)
+	}
+	if got := reconnectCalls.Load(); got != 0 {
+		t.Fatalf("reconnect fired on foreign peer B: got %d want 0", got)
+	}
+
+	// Frame 3: another foreign peer C — also dropped.
+	tr.handleIncomingFrame(mkFrame(peerC, []byte("another-ghost")))
+	if got := tr.peerEpoch.Load(); got != peerA {
+		t.Fatalf("foreign peer C mutated locked epoch: got 0x%08x want 0x%08x", got, peerA)
+	}
+	if got := reconnectCalls.Load(); got != 0 {
+		t.Fatalf("reconnect fired on foreign peer C: got %d want 0", got)
+	}
+
+	// Frame 4: peer A again — still our locked peer, KCP must not be reset.
+	tr.handleIncomingFrame(mkFrame(peerA, nil))
+	if got := tr.peerEpoch.Load(); got != peerA {
+		t.Fatalf("peer A re-arrival mutated epoch: got 0x%08x want 0x%08x", got, peerA)
+	}
+	if got := reconnectCalls.Load(); got != 0 {
+		t.Fatalf("reconnect fired on peer A re-arrival: got %d want 0", got)
+	}
+
+	// Frame 5: simulate interleaved storm — alternating B and A frames must
+	// not flap the epoch back and forth or fire any reconnect.
+	for i := 0; i < 5; i++ {
+		tr.handleIncomingFrame(mkFrame(peerB, []byte("ghost-storm")))
+		tr.handleIncomingFrame(mkFrame(peerA, nil))
+	}
+	if got := tr.peerEpoch.Load(); got != peerA {
+		t.Fatalf("alternating storm mutated epoch: got 0x%08x want 0x%08x", got, peerA)
+	}
+	if got := reconnectCalls.Load(); got != 0 {
+		t.Fatalf("reconnect fired during alternating storm: got %d want 0", got)
+	}
+
+	// KCP instance must be the same one we installed — resetKCP would have
+	// replaced it with a brand-new runtime.
+	tr.kcpMu.RLock()
+	currentKCP := tr.kcp
+	tr.kcpMu.RUnlock()
+	if currentKCP != originalKCP {
+		t.Fatal("kcp runtime was replaced — resetKCP fired despite first-peer lock")
 	}
 }

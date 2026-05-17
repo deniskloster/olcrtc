@@ -527,9 +527,9 @@ func (p *streamTransport) handleFirstPeer(peerEpoch uint32) {
 	logger.Infof("vp8channel: peer first seen epoch=0x%08x", peerEpoch)
 }
 
-// handleIncomingFrame parses the epoch header and either delivers the KCP
-// payload to the local session or triggers a reset when the peer's epoch
-// changes (peer process restart).
+// handleIncomingFrame parses the epoch header and delivers the KCP payload
+// to the local session. After the first peer's epoch is locked in, frames
+// from any other epoch are silently dropped (see foreign-peer branch below).
 func (p *streamTransport) handleIncomingFrame(frame []byte) {
 	frameToken, peerEpoch, ok := parseEpochHeader(frame)
 	if !ok {
@@ -554,19 +554,15 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 	if !p.hadPeer.Swap(true) {
 		p.handleFirstPeer(peerEpoch)
 	} else if prev := p.peerEpoch.Load(); prev != peerEpoch {
-		// Peer restarted its KCP session. Reset ours so the conv state
-		// machines re-converge. CAS guards against double-reset when
-		// fragmented frames straddle the epoch boundary.
-		if p.peerEpoch.CompareAndSwap(prev, peerEpoch) {
-			p.resetKCP()
-			p.reconnectMu.Lock()
-			fn := p.reconnectFn
-			p.reconnectMu.Unlock()
-			if fn != nil {
-				fn()
-			}
-		}
-		// Drop this packet: it predates our fresh KCP session.
+		// First-peer lock: ignore frames from other WebRTC peers in the same
+		// SFU room (e.g. Telemost ghost observers that auto-attach to fresh
+		// rooms). Without this lock, alternating frames from multiple peers
+		// toggle peerEpoch → resetKCP → reconnect → storm.
+		//
+		// Legitimate remote restart is detected via smux/KCP keepalive timeout
+		// or link disconnect, not via epoch flapping here.
+		logger.Debugf("vp8channel: ignoring frame from foreign peer epoch=0x%08x (locked to 0x%08x)",
+			peerEpoch, prev)
 		return
 	}
 
