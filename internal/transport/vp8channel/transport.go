@@ -168,6 +168,7 @@ func New(ctx context.Context, cfg transport.Config) (transport.Transport, error)
 		bindingToken:  bindingToken(cfg.RoomURL),
 		localEpoch:    randomEpoch(),
 	}
+	rememberLocalEpoch(tr.localEpoch)
 
 	if err := stream.AddTrack(track); err != nil {
 		return nil, fmt.Errorf("attach local video track: %w", err)
@@ -259,6 +260,31 @@ func randomEpoch() uint32 {
 		e = 1
 	}
 	return e
+}
+
+// Stale-self-echo guard.
+//
+// When a streamTransport tears down (Phase 5 reconnect on the client, room
+// retire on the server) and a fresh New() is constructed, the SFU keeps
+// reflecting the previous transport's published frames back to us for a
+// few seconds. Those frames carry the previous localEpoch, which is not
+// equal to the new transport's localEpoch — so the single-current-epoch
+// self-echo guard in handleIncomingFrame does not catch them, and the
+// first-peer lock locks onto the stale self-echo, ignoring real peer
+// frames forever.
+//
+// Remembering every localEpoch this process has ever used (kept forever;
+// 4 bytes per restart, negligible) lets us identify those leftover frames
+// and drop them.
+var seenLocalEpochs sync.Map // key: uint32, val: struct{}
+
+func rememberLocalEpoch(e uint32) {
+	seenLocalEpochs.Store(e, struct{}{})
+}
+
+func isStaleSelfEcho(e uint32) bool {
+	_, ok := seenLocalEpochs.Load(e)
+	return ok
 }
 
 func (p *streamTransport) Send(data []byte) error {
@@ -546,7 +572,12 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 	// remote track. Those frames carry our local epoch, not the peer's. If we
 	// treat them as peer traffic, epoch tracking toggles between "self" and
 	// "peer" and both sides loop forever resetting smux/KCP.
-	if peerEpoch == p.localEpoch {
+	//
+	// Also drop reflected frames from PREVIOUS transports in this process —
+	// after a teardown+restart, the SFU keeps echoing the old localEpoch for
+	// a few seconds; without this guard the new transport's first-peer lock
+	// latches onto that stale self-echo and rejects real peer frames.
+	if peerEpoch == p.localEpoch || isStaleSelfEcho(peerEpoch) {
 		logger.Debugf("vp8channel: self-echo detected epoch=0x%08x (SFU reflects our own track)", peerEpoch)
 		return
 	}
