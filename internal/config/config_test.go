@@ -127,3 +127,101 @@ func TestLoadMissing(t *testing.T) {
 		t.Fatal("expected error for missing file")
 	}
 }
+
+func TestLoadLegacySingleKey(t *testing.T) {
+	p := writeYAML(t, `
+mode: srv
+crypto:
+  key: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+`)
+	f, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Crypto.Key == "" {
+		t.Fatal("Key empty after legacy parse")
+	}
+	if len(f.Crypto.Peers) != 0 {
+		t.Fatalf("legacy yaml produced %d peers", len(f.Crypto.Peers))
+	}
+}
+
+func TestLoadMultiPeer(t *testing.T) {
+	p := writeYAML(t, `
+mode: srv
+crypto:
+  peers:
+    - client_id: "phone-abc"
+      key:       "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+    - client_id: "phone-xyz"
+      key:       "fedcba98765432100123456789abcdef0123456789abcdef0123456789abcdef"
+`)
+	f, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Crypto.Key != "" {
+		t.Fatalf("legacy Key should be empty in multi-peer mode: %q", f.Crypto.Key)
+	}
+	if len(f.Crypto.Peers) != 2 {
+		t.Fatalf("expected 2 peers, got %d", len(f.Crypto.Peers))
+	}
+	if f.Crypto.Peers[0].ClientID != "phone-abc" || f.Crypto.Peers[0].Key == "" {
+		t.Fatalf("peer 0 wrong: %+v", f.Crypto.Peers[0])
+	}
+	if f.Crypto.Peers[1].ClientID != "phone-xyz" {
+		t.Fatalf("peer 1 wrong: %+v", f.Crypto.Peers[1])
+	}
+}
+
+func TestLoadRejectsBothKeyAndPeers(t *testing.T) {
+	p := writeYAML(t, `
+crypto:
+  key: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+  peers:
+    - client_id: "x"
+      key:       "fedcba98765432100123456789abcdef0123456789abcdef0123456789abcdef"
+`)
+	_, err := Load(p)
+	if err == nil {
+		t.Fatal("expected error when both key and peers set")
+	}
+}
+
+func TestLoadRejectsDuplicatePeerKeys(t *testing.T) {
+	p := writeYAML(t, `
+crypto:
+  peers:
+    - client_id: "a"
+      key:       "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+    - client_id: "b"
+      key:       "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+`)
+	_, err := Load(p)
+	if err == nil {
+		t.Fatal("expected error for duplicate peer keys")
+	}
+}
+
+func TestLoadRejectsMissingClientID(t *testing.T) {
+	p := writeYAML(t, `
+crypto:
+  peers:
+    - key: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+`)
+	_, err := Load(p)
+	if err == nil {
+		t.Fatal("expected error for missing client_id")
+	}
+}
+
+// writeYAML writes content to a temp file and returns the path.
+func writeYAML(t *testing.T, content string) string {
+	t.Helper()
+	dir := t.TempDir()
+	p := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}

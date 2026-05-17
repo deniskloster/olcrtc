@@ -51,8 +51,25 @@ type Room struct {
 }
 
 // Crypto holds the shared secret used to authenticate and encrypt the tunnel.
+//
+// Two modes:
+//
+//   - Legacy single-key: set `key` only. All clients connecting to the room
+//     share the same key.
+//   - Phase 4 multi-peer: set `peers` to a list of {client_id, key} pairs.
+//     Each peer in the room uses a distinct AES key. Server tries each
+//     candidate key on the first incoming frame (Task 4.19 try-decrypt).
+//
+// `key` and `peers` are mutually exclusive — setting both is an error.
 type Crypto struct {
-	Key string `yaml:"key"` // 64-char hex (32 bytes)
+	Key   string    `yaml:"key"`   // 64-char hex (32 bytes) — legacy single-peer
+	Peers []PeerKey `yaml:"peers"` // Phase 4: per-client keys
+}
+
+// PeerKey is one entry in Crypto.Peers.
+type PeerKey struct {
+	ClientID string `yaml:"client_id"`
+	Key      string `yaml:"key"` // 64-char hex (32 bytes)
 }
 
 // Net groups network and transport selection.
@@ -125,7 +142,32 @@ func Load(path string) (File, error) {
 	if err := yaml.Unmarshal(data, &f); err != nil {
 		return File{}, fmt.Errorf("parse config %s: %w", path, err)
 	}
+	if err := f.validate(); err != nil {
+		return File{}, fmt.Errorf("validate config %s: %w", path, err)
+	}
 	return f, nil
+}
+
+// validate checks invariants the YAML grammar can't express.
+func (f *File) validate() error {
+	if f.Crypto.Key != "" && len(f.Crypto.Peers) > 0 {
+		return errors.New("crypto: cannot set both 'key' (legacy single-peer) and 'peers' (Phase 4 multi-peer) — pick one")
+	}
+	// Duplicate-key rejection (Task 4.19 prereq):
+	seen := make(map[string]bool, len(f.Crypto.Peers))
+	for i, p := range f.Crypto.Peers {
+		if p.ClientID == "" {
+			return fmt.Errorf("crypto.peers[%d]: client_id is required", i)
+		}
+		if p.Key == "" {
+			return fmt.Errorf("crypto.peers[%d]: key is required", i)
+		}
+		if seen[p.Key] {
+			return fmt.Errorf("crypto.peers[%d]: duplicate key (each peer must have a unique encryption key)", i)
+		}
+		seen[p.Key] = true
+	}
+	return nil
 }
 
 // Apply merges f onto dst. CLI-set fields (non-zero values in dst) win;
