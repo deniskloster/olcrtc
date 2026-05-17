@@ -18,7 +18,6 @@ import (
 	"github.com/openlibrecommunity/olcrtc/internal/handshake"
 	"github.com/openlibrecommunity/olcrtc/internal/link"
 	"github.com/openlibrecommunity/olcrtc/internal/logger"
-	"github.com/openlibrecommunity/olcrtc/internal/muxconn"
 	"github.com/openlibrecommunity/olcrtc/internal/names"
 	"github.com/xtaci/smux"
 )
@@ -50,32 +49,29 @@ type SessionCloseFunc func(sessionID, reason string)
 type TrafficFunc func(sessionID, addr string, bytesIn, bytesOut uint64)
 
 // Server handles incoming tunnel connections and proxies their traffic.
+// After Phase 4 (Task 4.5), Server owns N *Peer instances — each peer has
+// its own link.Link + muxconn + smux.Session + per-peer AES cipher. Per-peer
+// cipher mismatch naturally filters foreign-peer frames arriving via the
+// SFU broadcast.
 type Server struct {
-	ln             link.Link
-	cipher         *crypto.Cipher
-	conn           *muxconn.Conn
-	session        *smux.Session
-	sessMu         sync.RWMutex
-	reinstallMu    sync.Mutex
-	wg             sync.WaitGroup
-	authHook       handshake.AuthFunc
-	onOpen         SessionOpenFunc
-	onClose        SessionCloseFunc
-	onTraffic      TrafficFunc
-	deviceID       string
-	sessionID      string
+	// hooks shared across all peers
+	authHook  handshake.AuthFunc
+	onOpen    SessionOpenFunc
+	onClose   SessionCloseFunc
+	onTraffic TrafficFunc
+
+	// shared config
 	dnsServer      string
 	resolver       *net.Resolver
 	socksProxyAddr string
 	socksProxyPort int
 
-	// Phase 4: per-peer state. Until Task 4.5 rewrites Start, the old
-	// singular fields above (ln, cipher, conn, session, sessMu,
-	// reinstallMu, deviceID, sessionID) are still authoritative; peers
-	// is unused.
+	// peer state
 	peers    []*Peer
 	peersMu  sync.RWMutex
 	sessions *Sessions
+
+	wg sync.WaitGroup
 }
 
 // ConnectRequest is a message from the client to establish a new connection.
@@ -115,6 +111,13 @@ type Config struct {
 	URL             string
 	Token           string
 
+	// Peers is the Phase 4 multi-peer slice. If non-empty it takes
+	// precedence over KeyHex; each entry spawns its own link.Link +
+	// smux.Session bound to its own AES key. If empty, KeyHex is used
+	// to build a single "default" peer (back-compat with Phase 1-3
+	// single-peer callers like e2e tests and the docker olcrtc-server).
+	Peers []PeerConfig
+
 	// AuthHook is invoked after CLIENT_HELLO to authorize the client and
 	// return a session ID. If nil, every client is admitted with a random UUID.
 	AuthHook handshake.AuthFunc
@@ -132,9 +135,9 @@ func Run(ctx context.Context, cfg Config) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	cipher, err := setupCipher(cfg.KeyHex)
+	peerCfgs, err := buildPeerConfigs(cfg)
 	if err != nil {
-		return fmt.Errorf("setupCipher failed: %w", err)
+		return fmt.Errorf("build peers: %w", err)
 	}
 
 	hook := cfg.AuthHook
@@ -155,7 +158,6 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 
 	s := &Server{
-		cipher:         cipher,
 		authHook:       hook,
 		onOpen:         onOpen,
 		onClose:        onClose,
@@ -163,26 +165,50 @@ func Run(ctx context.Context, cfg Config) error {
 		dnsServer:      cfg.DNSServer,
 		socksProxyAddr: cfg.SOCKSProxyAddr,
 		socksProxyPort: cfg.SOCKSProxyPort,
+		sessions:       NewSessions(),
 	}
 	s.setupResolver()
 
-	if err := s.bringUpLink(runCtx, cfg, cancel); err != nil {
+	if err := s.bringUpPeers(runCtx, peerCfgs, cfg, cancel); err != nil {
+		s.shutdown()
+		s.wg.Wait()
 		return err
 	}
 
 	go func() {
 		<-runCtx.Done()
-		s.closeSession()
+		s.shutdown()
 	}()
 
-	s.serve(runCtx)
-
-	s.shutdown()
+	// Block until all peers' serve loops (and helpers) exit.
 	s.wg.Wait()
 
 	return nil
 }
 
+// buildPeerConfigs normalizes cfg.Peers + legacy cfg.KeyHex into a slice
+// of PeerConfig. If cfg.Peers is non-empty, use it directly. Otherwise
+// fall back to KeyHex as a single "default" peer.
+func buildPeerConfigs(cfg Config) ([]PeerConfig, error) {
+	if len(cfg.Peers) > 0 {
+		return cfg.Peers, nil
+	}
+	if cfg.KeyHex == "" {
+		return nil, ErrKeyRequired
+	}
+	key, err := hex.DecodeString(cfg.KeyHex)
+	if err != nil {
+		return nil, fmt.Errorf("decode KeyHex: %w", err)
+	}
+	if len(key) != 32 {
+		return nil, fmt.Errorf("%w, got %d", ErrKeySize, len(key))
+	}
+	return []PeerConfig{{ClientID: "default", Key: key}}, nil
+}
+
+// setupCipher decodes the hex key and creates a cipher. Retained for
+// existing test coverage (TestSetupCipher, TestSetupCipherRejectsBadInput).
+// Production callers go through buildPeerConfigs + Peer.setupCipher.
 func setupCipher(keyHex string) (*crypto.Cipher, error) {
 	if keyHex == "" {
 		return nil, ErrKeyRequired
@@ -227,11 +253,52 @@ func smuxConfig() *smux.Config {
 	return cfg
 }
 
-func (s *Server) bringUpLink(
+// bringUpPeers spawns N peers in parallel. Returns nil if ALL peers
+// become ready, or the first error if any fails. On any error, all
+// other peers are also closed (no partial-ready operation).
+func (s *Server) bringUpPeers(
 	ctx context.Context,
+	pconfigs []PeerConfig,
 	cfg Config,
 	cancel context.CancelFunc,
 ) error {
+	errCh := make(chan error, len(pconfigs))
+	for _, pc := range pconfigs {
+		peer := NewPeer(pc.ClientID, pc.Key)
+		peer.parent = s
+		s.peersMu.Lock()
+		s.peers = append(s.peers, peer)
+		s.peersMu.Unlock()
+		s.sessions.Register(peer)
+		go func(p *Peer) {
+			errCh <- s.startPeer(ctx, p, cfg, cancel)
+		}(peer)
+	}
+	var firstErr error
+	for i := 0; i < len(pconfigs); i++ {
+		if err := <-errCh; err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+	logger.Infof("Link connected (peers=%d)", len(pconfigs))
+	return nil
+}
+
+// startPeer wires one Peer end-to-end: cipher → link → ICE/Connect →
+// muxconn+smux.Server → serve loop. Closes peer.readyCh on success.
+// Blocks until either the peer is ready or an error occurs.
+func (s *Server) startPeer(
+	ctx context.Context,
+	p *Peer,
+	cfg Config,
+	cancel context.CancelFunc,
+) error {
+	if err := p.setupCipher(); err != nil {
+		return fmt.Errorf("peer %s: %w", p.ClientID, err)
+	}
 	ln, err := link.New(ctx, cfg.Link, link.Config{
 		Transport:       cfg.Transport,
 		Carrier:         cfg.Carrier,
@@ -241,7 +308,7 @@ func (s *Server) bringUpLink(
 		Token:           cfg.Token,
 		DeviceID:        "",
 		Name:            names.Generate(),
-		OnData:          s.onData,
+		OnData:          p.onData,
 		DNSServer:       s.dnsServer,
 		ProxyAddr:       s.socksProxyAddr,
 		ProxyPort:       s.socksProxyPort,
@@ -263,174 +330,45 @@ func (s *Server) bringUpLink(
 		SEIAckTimeoutMS: cfg.SEIAckTimeoutMS,
 	})
 	if err != nil {
-		return fmt.Errorf("failed to create link: %w", err)
+		return fmt.Errorf("peer %s: link.New: %w", p.ClientID, err)
 	}
-	s.ln = ln
+	p.mu.Lock()
+	p.Link = ln
+	p.mu.Unlock()
 
 	ln.SetEndedCallback(func(reason string) {
-		logger.Infof("Server link reported conference end: %s", reason)
-		cancel()
+		logger.Infof("peer %s: link reported conference end: %s", p.ClientID, reason)
+		cancel() // ending conference cancels the whole server
 	})
 	ln.SetShouldReconnect(func() bool { return ctx.Err() == nil })
 	ln.SetReconnectCallback(func() {
 		if ctx.Err() != nil {
 			return
 		}
-		s.handleReconnect()
+		p.handleReconnect()
 	})
 
-	logger.Infof("Connecting link via %s/%s/%s...", cfg.Link, cfg.Transport, cfg.Carrier)
+	logger.Infof("peer %s: connecting link via %s/%s/%s...", p.ClientID, cfg.Link, cfg.Transport, cfg.Carrier)
 	if err := ln.Connect(ctx); err != nil {
-		return fmt.Errorf("failed to connect link: %w", err)
+		return fmt.Errorf("peer %s: link.Connect: %w", p.ClientID, err)
 	}
-	logger.Infof("Link connected")
+	logger.Infof("peer %s: link connected", p.ClientID)
 
-	s.installSession()
+	p.installSession()
+	close(p.readyCh)
 
-	s.wg.Add(1)
+	// Spawn per-peer goroutines (watcher + serve loop). They keep
+	// s.wg alive until shutdown.
+	s.wg.Add(2)
 	go func() {
 		defer s.wg.Done()
 		ln.WatchConnection(ctx)
 	}()
+	go func() {
+		defer s.wg.Done()
+		p.serve(ctx)
+	}()
 	return nil
-}
-
-func (s *Server) installSession() {
-	conn := muxconn.New(s.ln, s.cipher)
-	sess, err := smux.Server(conn, smuxConfig())
-	if err != nil {
-		logger.Warnf("smux server init failed: %v", err)
-		return
-	}
-	s.sessMu.Lock()
-	s.conn = conn
-	s.session = sess
-	s.sessMu.Unlock()
-}
-
-func (s *Server) handleReconnect() {
-	logger.Infof("server link reconnect - tearing down smux session")
-	s.sessMu.RLock()
-	current := s.session
-	s.sessMu.RUnlock()
-	s.reinstallSession(current)
-}
-
-func (s *Server) reinstallSession(dead *smux.Session) {
-	s.reinstallMu.Lock()
-	defer s.reinstallMu.Unlock()
-
-	// Pre-build the replacement so we can swap atomically below.
-	newConn := muxconn.New(s.ln, s.cipher)
-	newSess, err := smux.Server(newConn, smuxConfig())
-	if err != nil {
-		logger.Warnf("smux server init failed: %v", err)
-		_ = newConn.Close()
-		return
-	}
-
-	s.sessMu.Lock()
-	if s.session != dead {
-		// Someone else already reinstalled — discard our build.
-		s.sessMu.Unlock()
-		_ = newSess.Close()
-		_ = newConn.Close()
-		return
-	}
-	oldSess := s.session
-	oldConn := s.conn
-	oldSID := s.sessionID
-	s.session = newSess
-	s.conn = newConn
-	s.sessionID = ""
-	s.deviceID = ""
-	s.sessMu.Unlock()
-
-	if oldSess != nil {
-		_ = oldSess.Close()
-	}
-	if oldConn != nil {
-		_ = oldConn.Close()
-	}
-	if oldSID != "" {
-		s.onClose(oldSID, "reconnect")
-	}
-}
-
-func (s *Server) closeSession() {
-	s.sessMu.Lock()
-	sess := s.session
-	conn := s.conn
-	s.session = nil
-	s.conn = nil
-	oldSID := s.sessionID
-	s.sessionID = ""
-	s.deviceID = ""
-	s.sessMu.Unlock()
-
-	if conn != nil {
-		_ = conn.Close()
-	}
-	if sess != nil {
-		_ = sess.Close()
-	}
-	if oldSID != "" {
-		s.onClose(oldSID, "closed")
-	}
-}
-
-func (s *Server) onData(data []byte) {
-	s.sessMu.RLock()
-	conn := s.conn
-	s.sessMu.RUnlock()
-	if conn != nil {
-		conn.Push(data)
-	}
-}
-
-// serve drives the smux Accept loop. The first accepted stream on a given
-// smux session is the control stream — the handshake runs there. Subsequent
-// streams are tunnel streams and proxy traffic.
-func (s *Server) serve(ctx context.Context) {
-	for {
-		if contextDone(ctx) {
-			return
-		}
-
-		s.sessMu.RLock()
-		sess := s.session
-		s.sessMu.RUnlock()
-		if sess == nil {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(50 * time.Millisecond):
-				continue
-			}
-		}
-
-		if !s.handshakeReady() {
-			if !s.acceptHandshake(ctx, sess) {
-				continue
-			}
-		}
-
-		stream, err := sess.AcceptStream()
-		if err != nil {
-			if contextDone(ctx) {
-				return
-			}
-			logger.Debugf("AcceptStream returned %v - reinstalling session", err)
-			s.reinstallSession(sess)
-			continue
-		}
-
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			s.handleStream(ctx, stream)
-		}()
-	}
 }
 
 func contextDone(ctx context.Context) bool {
@@ -442,71 +380,22 @@ func contextDone(ctx context.Context) bool {
 	}
 }
 
-// handshakeReady reports whether the current session has completed its
-// handshake. The session is reset on reconnect, so this is recomputed.
-func (s *Server) handshakeReady() bool {
-	s.sessMu.RLock()
-	defer s.sessMu.RUnlock()
-	return s.sessionID != ""
-}
-
-func (s *Server) acceptHandshake(ctx context.Context, sess *smux.Session) bool {
-	stream, err := sess.AcceptStream()
-	if err != nil {
-		select {
-		case <-ctx.Done():
-			return false
-		default:
-		}
-		logger.Debugf("AcceptStream(control) returned %v - reinstalling session", err)
-		s.reinstallSession(sess)
-		return false
-	}
-	_ = stream.SetDeadline(time.Now().Add(handshake.DefaultTimeout))
-	hello, sid, err := handshake.Server(stream, s.authHook)
-	_ = stream.SetDeadline(time.Time{})
-	if err != nil {
-		logger.Warnf("handshake failed: %v", err)
-		_ = stream.Close()
-		s.reinstallSession(sess)
-		return false
-	}
-	s.sessMu.Lock()
-	s.deviceID = hello.DeviceID
-	s.sessionID = sid
-	s.sessMu.Unlock()
-	s.onOpen(sid, hello.DeviceID, hello.Claims)
-	logger.Infof("session %s opened (device=%s)", sid, hello.DeviceID)
-	// The control stream stays open for the lifetime of the session;
-	// keep it parked in a goroutine so the smux session does not close it.
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		s.parkControlStream(stream)
-	}()
-	return true
-}
-
-// parkControlStream blocks reading from the control stream until it closes.
-// Future control messages (kick, rate updates, etc.) would be dispatched here.
-func (s *Server) parkControlStream(stream *smux.Stream) {
-	defer func() { _ = stream.Close() }()
-	buf := make([]byte, 64)
-	for {
-		if _, err := stream.Read(buf); err != nil {
-			return
-		}
-	}
-}
-
+// shutdown closes every peer. Called when the server context cancels or
+// when bringUpPeers errors out.
 func (s *Server) shutdown() {
-	s.closeSession()
-	if s.ln != nil {
-		_ = s.ln.Close()
+	s.peersMu.RLock()
+	peers := append([]*Peer(nil), s.peers...)
+	s.peersMu.RUnlock()
+	for _, p := range peers {
+		p.Close()
 	}
 }
 
-func (s *Server) handleStream(_ context.Context, stream *smux.Stream) {
+// handleStream reads the connect-request JSON from the stream, then
+// dispatches the proxied connection. sid is the originating peer's
+// sessionID (or "" if called from a test without a peer); it's threaded
+// through to onTraffic.
+func (s *Server) handleStream(_ context.Context, stream *smux.Stream, sid string) {
 	defer func() { _ = stream.Close() }()
 
 	// Read the connect JSON. The client writes the whole JSON in one
@@ -522,7 +411,7 @@ func (s *Server) handleStream(_ context.Context, stream *smux.Stream) {
 			header = append(header, tmp[:n]...)
 			if req, ok := parseConnectRequest(header); ok {
 				_ = stream.SetReadDeadline(time.Time{})
-				s.dispatch(stream, req)
+				s.dispatch(stream, req, sid)
 				return
 			}
 		}
@@ -552,13 +441,9 @@ func defaultAuthHook(_ string, _ map[string]any) (string, error) {
 	return uuid.NewString(), nil
 }
 
-func (s *Server) dispatch(stream *smux.Stream, req ConnectRequest) {
+func (s *Server) dispatch(stream *smux.Stream, req ConnectRequest, sid string) {
 	addr := net.JoinHostPort(req.Addr, strconv.Itoa(req.Port))
 	logger.Infof("sid=%d connect %s", stream.ID(), addr)
-
-	s.sessMu.RLock()
-	sid := s.sessionID
-	s.sessMu.RUnlock()
 
 	dialStart := time.Now()
 	conn, err := s.dial(req)

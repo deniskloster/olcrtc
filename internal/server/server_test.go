@@ -198,8 +198,8 @@ func TestSetupResolver(t *testing.T) {
 }
 
 func TestOnDataWithNilConn(_ *testing.T) {
-	s := &Server{}
-	s.onData([]byte("ignored"))
+	p := NewPeer("test", nil)
+	p.onData([]byte("ignored")) // must not panic when p.Mux is nil
 }
 
 type serverLinkStub struct {
@@ -221,14 +221,14 @@ func TestShutdownClosesLinkAndConn(t *testing.T) {
 		t.Fatalf("NewCipher() error = %v", err)
 	}
 	ln := &serverLinkStub{}
-	s := &Server{
-		ln:     ln,
-		cipher: cipher,
-		conn:   muxconn.New(ln, cipher),
-	}
+	p := NewPeer("test", []byte("01234567890123456789012345678901"))
+	p.Link = ln
+	p.Cipher = cipher
+	p.Mux = muxconn.New(ln, cipher)
+	s := &Server{peers: []*Peer{p}, sessions: NewSessions()}
 	s.shutdown()
 	if !ln.closed {
-		t.Fatal("shutdown() did not close link")
+		t.Fatal("shutdown() did not close peer link")
 	}
 }
 
@@ -328,7 +328,7 @@ func TestHandleStreamDispatchAfterConnect(t *testing.T) {
 	go func() {
 		stream, err := serverSess.AcceptStream()
 		if err == nil {
-			(&Server{}).handleStream(context.Background(), stream)
+			(&Server{}).handleStream(context.Background(), stream, "")
 		}
 		close(done)
 	}()
@@ -356,18 +356,21 @@ func TestReinstallSessionFiresOnClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewCipher() error = %v", err)
 	}
+	ln := &serverLinkStub{}
 	var got struct {
 		sid    string
 		reason string
 	}
 	s := &Server{
-		ln:        &serverLinkStub{},
-		cipher:    cipher,
-		sessionID: "sid-123",
-		deviceID:  "dev-123",
-		onClose:   func(sid, reason string) { got.sid = sid; got.reason = reason },
+		onClose: func(sid, reason string) { got.sid = sid; got.reason = reason },
 	}
-	s.closeSession()
+	p := NewPeer("test", []byte("01234567890123456789012345678901"))
+	p.parent = s
+	p.Link = ln
+	p.Cipher = cipher
+	p.sessionID = "sid-123"
+	p.deviceID = "dev-123"
+	p.closeSession()
 	if got.sid != "sid-123" || got.reason != "closed" {
 		t.Fatalf("onClose = %+v, want {sid-123 closed}", got)
 	}
@@ -416,8 +419,7 @@ func TestDispatchFiresOnTraffic(t *testing.T) {
 	}
 	recChan := make(chan struct{})
 	s := &Server{
-		sessionID: "traffic-sid",
-		resolver:  net.DefaultResolver,
+		resolver: net.DefaultResolver,
 		onTraffic: func(sid, addr string, in, out uint64) {
 			rec.sid = sid
 			rec.addr = addr
@@ -432,7 +434,7 @@ func TestDispatchFiresOnTraffic(t *testing.T) {
 		if err != nil {
 			return
 		}
-		s.handleStream(context.Background(), stream)
+		s.handleStream(context.Background(), stream, "traffic-sid")
 	}()
 
 	stream, err := clientSess.OpenStream()
