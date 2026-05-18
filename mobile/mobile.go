@@ -74,7 +74,31 @@ var (
 	done               chan struct{} //nolint:gochecknoglobals // package-level state intentional
 	ready              chan struct{} //nolint:gochecknoglobals // package-level state intentional
 	errRun             error
+	runCompleteCB      RunCompleteCallback //nolint:gochecknoglobals // package-level state intentional
 )
+
+// RunCompleteCallback is fired once when the client goroutine exits,
+// regardless of why. Set this from the host (mobile app) BEFORE calling
+// Start so post-ready failures (watchdog detected smux death, smux
+// keep-alive timeout that bubbled up, panic, etc.) propagate up to the
+// host as an error. Without this, mobile.WaitReady is the only error
+// surface and it stops watching the moment the local SOCKS5 listener
+// is up — so anything that goes wrong AFTER ready is invisible.
+//
+// errMsg is empty when the goroutine exited with no error (e.g. user
+// called Stop() and the parent ctx was cancelled). A non-empty errMsg
+// is the host's signal to tear down + re-allocate.
+type RunCompleteCallback interface {
+	OnRunComplete(errMsg string)
+}
+
+// SetRunCompleteCallback registers the callback fired when the olcrtc
+// client goroutine exits. Pass nil to clear.
+func SetRunCompleteCallback(cb RunCompleteCallback) {
+	mu.Lock()
+	runCompleteCB = cb
+	mu.Unlock()
+}
 
 type mobileConfig struct {
 	link         string
@@ -568,8 +592,19 @@ func startWithConfig(
 		mu.Lock()
 		cancel = nil
 		errRun = err
+		cb := runCompleteCB
 		mu.Unlock()
 		close(done)
+
+		// Fire callback OUTSIDE the lock: the host's handler may
+		// itself touch package state via subsequent calls.
+		if cb != nil {
+			msg := ""
+			if err != nil {
+				msg = err.Error()
+			}
+			cb.OnRunComplete(msg)
+		}
 	}()
 
 	return nil

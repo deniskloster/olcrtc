@@ -61,6 +61,11 @@ type Client struct {
 	dnsServer   string
 	socksUser   string
 	socksPass   string
+	// deathReason is set by monitorSession before cancelling runCtx.
+	// RunWithReady's tail reads it to decide whether to return an error
+	// (so the upstream host service learns the tunnel died) vs nil
+	// (clean shutdown via parent ctx). Empty string means "no death".
+	deathReason sync.Map // single key "reason" -> string
 }
 
 // Config holds runtime configuration for [Run] and [RunWithReady].
@@ -168,8 +173,26 @@ func RunWithReady(ctx context.Context, cfg Config, onReady func()) error {
 	go c.monitorSession(runCtx, cancel)
 
 	<-runCtx.Done()
+
+	// If the watchdog (or any internal handler) recorded a death reason,
+	// surface it as an error so the host service (mobile.Start, then the
+	// Android VPN service) can react. Without this, returning nil makes
+	// every kind of internal death indistinguishable from a clean stop
+	// via parent ctx — and the host service never triggers re-alloc.
+	if reason, ok := c.deathReason.Load("reason"); ok {
+		if s, _ := reason.(string); s != "" {
+			return fmt.Errorf("%w: %s", ErrTunnelDied, s)
+		}
+	}
 	return nil
 }
+
+// ErrTunnelDied is returned from RunWithReady when an internal watchdog
+// (or other detector) cancelled the run because the tunnel became
+// unusable while the parent ctx is still alive. The host service uses
+// this to distinguish "user stopped the tunnel" (returns nil) from
+// "tunnel died, please tear down and re-allocate" (returns this error).
+var ErrTunnelDied = errors.New("tunnel died")
 
 // sessionMonitorInterval / sessionMonitorThreshold control how the
 // smux watchdog reacts to a dead session. handleReconnect briefly
@@ -214,11 +237,13 @@ func (c *Client) monitorSession(ctx context.Context, cancel context.CancelFunc) 
 			if sess == nil || sess.IsClosed() {
 				broken++
 				if broken >= sessionMonitorThreshold {
-					logger.Warnf(
-						"client: smux session dead for ~%v (sess==nil:%v) — unwinding RunWithReady",
+					reason := fmt.Sprintf(
+						"smux session dead for ~%v (sess==nil:%v)",
 						time.Duration(broken)*sessionMonitorInterval,
 						sess == nil,
 					)
+					logger.Warnf("client: %s — unwinding RunWithReady", reason)
+					c.deathReason.Store("reason", reason)
 					cancel()
 					return
 				}
