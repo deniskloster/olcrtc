@@ -79,3 +79,13 @@ func (d *directLink) WatchConnection(ctx context.Context) {
 	d.transport.WatchConnection(ctx)
 }
 func (d *directLink) CanSend() bool { return d.transport.CanSend() }
+
+// ResetPeerLock forwards to the underlying transport if it implements the
+// optional interface (only vp8channel does today). Used by server.Peer to
+// release the first-peer lock when an smux session closes so the next
+// peer reconnect can latch on a fresh epoch.
+func (d *directLink) ResetPeerLock() {
+	if r, ok := d.transport.(interface{ ResetPeerLock() }); ok {
+		r.ResetPeerLock()
+	}
+}

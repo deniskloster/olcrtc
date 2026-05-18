@@ -180,6 +180,12 @@ func (p *Peer) reinstallSession(dead *smux.Session) {
 	if oldSID != "" && p.parent != nil {
 		p.parent.onClose(oldSID, "reconnect")
 	}
+	// Release the vp8channel first-peer lock so the next peer reconnect
+	// can latch onto a fresh epoch. Without this, the lock stays pinned
+	// to the dead session's peer epoch and every subsequent reconnect
+	// gets dropped as "foreign peer". Optional-interface, no-op for
+	// links/transports that don't support it.
+	resetPeerLock(p.Link)
 }
 
 // closeSession tears down this peer's session and reports onClose with
@@ -204,6 +210,16 @@ func (p *Peer) closeSession() {
 	}
 	if oldSID != "" && p.parent != nil {
 		p.parent.onClose(oldSID, "closed")
+	}
+	resetPeerLock(p.Link)
+}
+
+// resetPeerLock invokes Link.ResetPeerLock() if implemented (vp8channel
+// via directLink). Centralised so reinstallSession + closeSession stay
+// in sync.
+func resetPeerLock(ln any) {
+	if r, ok := ln.(interface{ ResetPeerLock() }); ok {
+		r.ResetPeerLock()
 	}
 }
 

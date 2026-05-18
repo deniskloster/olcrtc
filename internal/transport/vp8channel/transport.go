@@ -572,6 +572,29 @@ func (p *streamTransport) handleFirstPeer(peerEpoch uint32) {
 	logger.Infof("vp8channel: peer first seen epoch=0x%08x", peerEpoch)
 }
 
+// ResetPeerLock clears the first-peer lock so the next non-self epoch can
+// be latched on as the new peer. Called when an smux session closes
+// (server-side reinstall / peer disconnect). Without this, after the first
+// peer's session ends, the lock keeps the streamTransport pinned to the
+// dead peer's epoch and every subsequent reconnect attempt is dropped as
+// "foreign peer".
+//
+// Note: localEpoch is intentionally NOT reset — it remains stamped on
+// outgoing frames. seenLocalEpochs is also retained so SFU-reflected
+// frames from prior transports keep being filtered out.
+func (p *streamTransport) ResetPeerLock() {
+	wasPeer := p.hadPeer.Load()
+	priorEpoch := p.peerEpoch.Load()
+	p.hadPeer.Store(false)
+	p.peerEpoch.Store(0)
+	p.sentFirst.Store(false)
+	// Reset dedup so the next first-peer / first-send is logged again.
+	p.loggedDecisions = sync.Map{}
+	if wasPeer {
+		logger.Infof("vp8diag: peer-lock RESET (was locked to 0x%08x)", priorEpoch)
+	}
+}
+
 // handleIncomingFrame parses the epoch header and delivers the KCP payload
 // to the local session. After the first peer's epoch is locked in, frames
 // from any other epoch are silently dropped (see foreign-peer branch below).
