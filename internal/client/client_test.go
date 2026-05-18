@@ -517,3 +517,142 @@ func TestShutdownClosesLinkAndConn(t *testing.T) {
 		t.Fatal("shutdown() did not close link")
 	}
 }
+
+// Watchdog tests shorten the polling interval/threshold via the package
+// vars so they run in milliseconds instead of seconds.
+func withFastMonitor(t *testing.T, interval time.Duration, threshold int) {
+	t.Helper()
+	origI, origT := sessionMonitorInterval, sessionMonitorThreshold
+	t.Cleanup(func() {
+		sessionMonitorInterval = origI
+		sessionMonitorThreshold = origT
+	})
+	sessionMonitorInterval = interval
+	sessionMonitorThreshold = threshold
+}
+
+func TestMonitorSessionCancelsOnClosedSession(t *testing.T) {
+	withFastMonitor(t, 5*time.Millisecond, 3)
+
+	a, b := net.Pipe()
+	defer func() { _ = a.Close(); _ = b.Close() }()
+	serverSess, err := smux.Server(a, smuxConfig())
+	if err != nil {
+		t.Fatalf("smux.Server() error = %v", err)
+	}
+	defer func() { _ = serverSess.Close() }()
+	clientSess, err := smux.Client(b, smuxConfig())
+	if err != nil {
+		t.Fatalf("smux.Client() error = %v", err)
+	}
+
+	c := &Client{}
+	c.sessMu.Lock()
+	c.session = clientSess
+	c.sessMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		c.monitorSession(ctx, cancel)
+		close(done)
+	}()
+
+	_ = clientSess.Close()
+
+	select {
+	case <-ctx.Done():
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("watchdog did not cancel ctx after session close")
+	}
+	<-done
+}
+
+func TestMonitorSessionLeavesHealthySessionAlone(t *testing.T) {
+	withFastMonitor(t, 5*time.Millisecond, 3)
+
+	a, b := net.Pipe()
+	defer func() { _ = a.Close(); _ = b.Close() }()
+	serverSess, err := smux.Server(a, smuxConfig())
+	if err != nil {
+		t.Fatalf("smux.Server() error = %v", err)
+	}
+	defer func() { _ = serverSess.Close() }()
+	clientSess, err := smux.Client(b, smuxConfig())
+	if err != nil {
+		t.Fatalf("smux.Client() error = %v", err)
+	}
+	defer func() { _ = clientSess.Close() }()
+
+	c := &Client{}
+	c.sessMu.Lock()
+	c.session = clientSess
+	c.sessMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		c.monitorSession(ctx, cancel)
+		close(done)
+	}()
+
+	select {
+	case <-ctx.Done():
+		t.Fatal("watchdog cancelled healthy session")
+	case <-time.After(100 * time.Millisecond):
+	}
+	cancel()
+	<-done
+}
+
+func TestMonitorSessionToleratesTransientReconnect(t *testing.T) {
+	// Threshold of 6 ticks @ 5ms = 30ms. We blank the session for 10ms
+	// (well below the threshold) to mimic handleReconnect's nil window,
+	// then restore it. The watchdog must NOT cancel.
+	withFastMonitor(t, 5*time.Millisecond, 6)
+
+	a, b := net.Pipe()
+	defer func() { _ = a.Close(); _ = b.Close() }()
+	serverSess, err := smux.Server(a, smuxConfig())
+	if err != nil {
+		t.Fatalf("smux.Server() error = %v", err)
+	}
+	defer func() { _ = serverSess.Close() }()
+	clientSess, err := smux.Client(b, smuxConfig())
+	if err != nil {
+		t.Fatalf("smux.Client() error = %v", err)
+	}
+	defer func() { _ = clientSess.Close() }()
+
+	c := &Client{}
+	c.sessMu.Lock()
+	c.session = clientSess
+	c.sessMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		c.monitorSession(ctx, cancel)
+		close(done)
+	}()
+
+	c.sessMu.Lock()
+	c.session = nil
+	c.sessMu.Unlock()
+
+	time.Sleep(10 * time.Millisecond)
+
+	c.sessMu.Lock()
+	c.session = clientSess
+	c.sessMu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		t.Fatal("watchdog cancelled during transient reconnect window")
+	case <-time.After(100 * time.Millisecond):
+	}
+	cancel()
+	<-done
+}

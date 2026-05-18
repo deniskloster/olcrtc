@@ -165,9 +165,68 @@ func RunWithReady(ctx context.Context, cfg Config, onReady func()) error {
 	}
 
 	go c.acceptLoop(runCtx, listener)
+	go c.monitorSession(runCtx, cancel)
 
 	<-runCtx.Done()
 	return nil
+}
+
+// sessionMonitorInterval / sessionMonitorThreshold control how the
+// smux watchdog reacts to a dead session. handleReconnect briefly
+// nils c.session while it rebuilds smux (up to 5 attempts × 300ms),
+// so the threshold gives that path room to complete. Variables so
+// tests can shorten them.
+var (
+	sessionMonitorInterval  = 2 * time.Second
+	sessionMonitorThreshold = 3
+)
+
+// monitorSession watches c.session for unexpected death. handleReconnect
+// already covers the case where the WebRTC link tears down and rebuilds —
+// it re-handshakes smux on top of the new link. But smux can die WITHOUT
+// the link callback firing: keep-alive timeout after a carrier blip,
+// server-side RST, KCP stall propagated up. When that happens, c.session
+// is closed (or nil) and every subsequent SOCKS5 request returns
+// HostUnreachable silently (handleSocks5 line ~492). The host VPN service
+// has no signal that the tunnel is dead, so the user sees "connected" in
+// the UI while every app on the phone hits the void.
+//
+// The watchdog polls c.session and, after a debounce window long enough
+// to ride out handleReconnect, cancels runCtx. RunWithReady unwinds,
+// defer c.shutdown() fires (commit ec9d210 made shutdown safe on any
+// partial state), mobile.Start returns an error, and the Android VPN
+// service's Status.Error observer tears down the TUN + re-allocates a
+// fresh channel via the conductor.
+func (c *Client) monitorSession(ctx context.Context, cancel context.CancelFunc) {
+	ticker := time.NewTicker(sessionMonitorInterval)
+	defer ticker.Stop()
+
+	broken := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			c.sessMu.RLock()
+			sess := c.session
+			c.sessMu.RUnlock()
+
+			if sess == nil || sess.IsClosed() {
+				broken++
+				if broken >= sessionMonitorThreshold {
+					logger.Warnf(
+						"client: smux session dead for ~%v (sess==nil:%v) — unwinding RunWithReady",
+						time.Duration(broken)*sessionMonitorInterval,
+						sess == nil,
+					)
+					cancel()
+					return
+				}
+			} else {
+				broken = 0
+			}
+		}
+	}
 }
 
 func (c *Client) bringUpLink(
