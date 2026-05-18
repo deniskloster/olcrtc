@@ -154,13 +154,15 @@ func (s *Session) setupPeerConnections(config webrtc.Configuration) error {
 	}
 	s.pcSub.OnConnectionStateChange(s.onSubscriberConnectionStateChange)
 	s.pcSub.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		logger.Infof("trackdiag: SUB OnTrack kind=%s codec=%s ssrc=%d stream=%s track=%s",
+			track.Kind(), track.Codec().MimeType, track.SSRC(), track.StreamID(), track.ID())
 		if track.Kind() != webrtc.RTPCodecTypeVideo {
 			return
 		}
-		logger.Infof("goolom remote video track: codec=%s stream=%s track=%s",
-			track.Codec().MimeType, track.StreamID(), track.ID())
 		if cb := s.videoTrackHandler(); cb != nil {
 			cb(track, receiver)
+		} else {
+			logger.Infof("trackdiag: WARN no videoTrackHandler set — track=%s dropped", track.ID())
 		}
 	})
 

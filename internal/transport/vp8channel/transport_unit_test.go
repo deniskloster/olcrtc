@@ -128,7 +128,7 @@ func TestNewConnectSendCallbacksFeaturesAndClose(t *testing.T) {
 	binary.BigEndian.PutUint32(firstFrame[epochOff:crcOff], peerEpoch)
 	binary.BigEndian.PutUint32(firstFrame[crcOff:epochHdrLen], epochCRC(tr.bindingToken, peerEpoch))
 	copy(firstFrame[epochHdrLen:], []byte("data"))
-	tr.handleIncomingFrame(firstFrame)
+	tr.handleIncomingFrame(firstFrame, "test")
 	if tr.kcp == nil {
 		t.Fatal("kcp not initialized after first peer frame")
 	}
@@ -295,13 +295,13 @@ func TestHandleIncomingFrameEpochFilteringAndReconnect(t *testing.T) {
 		return frame
 	}
 
-	tr.handleIncomingFrame(mkFrame(bindingToken("other"), 1, []byte("x")))
-	tr.handleIncomingFrame(mkFrame(tr.bindingToken, tr.localEpoch, []byte("self")))
+	tr.handleIncomingFrame(mkFrame(bindingToken("other"), 1, []byte("x")), "test")
+	tr.handleIncomingFrame(mkFrame(tr.bindingToken, tr.localEpoch, []byte("self")), "test")
 	if tr.hadPeer.Load() || called != 0 {
 		t.Fatal("filtered frames changed peer state")
 	}
 
-	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 1, nil))
+	tr.handleIncomingFrame(mkFrame(tr.bindingToken, 1, nil), "test")
 	if !tr.hadPeer.Load() || tr.peerEpoch.Load() != 1 {
 		t.Fatalf("peer state after first frame: had=%v epoch=%d", tr.hadPeer.Load(), tr.peerEpoch.Load())
 	}
@@ -374,7 +374,7 @@ func TestHandleIncomingFrameFirstPeerLockIgnoresForeignEpochs(t *testing.T) {
 	)
 
 	// Frame 1: first peer A — should record epoch.
-	tr.handleIncomingFrame(mkFrame(peerA, nil))
+	tr.handleIncomingFrame(mkFrame(peerA, nil), "test")
 	if !tr.hadPeer.Load() {
 		t.Fatal("first peer frame did not mark hadPeer")
 	}
@@ -386,7 +386,7 @@ func TestHandleIncomingFrameFirstPeerLockIgnoresForeignEpochs(t *testing.T) {
 	}
 
 	// Frame 2: foreign peer B (ghost) — should be silently dropped.
-	tr.handleIncomingFrame(mkFrame(peerB, []byte("ghost")))
+	tr.handleIncomingFrame(mkFrame(peerB, []byte("ghost")), "test")
 	if got := tr.peerEpoch.Load(); got != peerA {
 		t.Fatalf("foreign peer B mutated locked epoch: got 0x%08x want 0x%08x", got, peerA)
 	}
@@ -395,7 +395,7 @@ func TestHandleIncomingFrameFirstPeerLockIgnoresForeignEpochs(t *testing.T) {
 	}
 
 	// Frame 3: another foreign peer C — also dropped.
-	tr.handleIncomingFrame(mkFrame(peerC, []byte("another-ghost")))
+	tr.handleIncomingFrame(mkFrame(peerC, []byte("another-ghost")), "test")
 	if got := tr.peerEpoch.Load(); got != peerA {
 		t.Fatalf("foreign peer C mutated locked epoch: got 0x%08x want 0x%08x", got, peerA)
 	}
@@ -404,7 +404,7 @@ func TestHandleIncomingFrameFirstPeerLockIgnoresForeignEpochs(t *testing.T) {
 	}
 
 	// Frame 4: peer A again — still our locked peer, KCP must not be reset.
-	tr.handleIncomingFrame(mkFrame(peerA, nil))
+	tr.handleIncomingFrame(mkFrame(peerA, nil), "test")
 	if got := tr.peerEpoch.Load(); got != peerA {
 		t.Fatalf("peer A re-arrival mutated epoch: got 0x%08x want 0x%08x", got, peerA)
 	}
@@ -415,8 +415,8 @@ func TestHandleIncomingFrameFirstPeerLockIgnoresForeignEpochs(t *testing.T) {
 	// Frame 5: simulate interleaved storm — alternating B and A frames must
 	// not flap the epoch back and forth or fire any reconnect.
 	for i := 0; i < 5; i++ {
-		tr.handleIncomingFrame(mkFrame(peerB, []byte("ghost-storm")))
-		tr.handleIncomingFrame(mkFrame(peerA, nil))
+		tr.handleIncomingFrame(mkFrame(peerB, []byte("ghost-storm")), "test")
+		tr.handleIncomingFrame(mkFrame(peerA, nil), "test")
 	}
 	if got := tr.peerEpoch.Load(); got != peerA {
 		t.Fatalf("alternating storm mutated epoch: got 0x%08x want 0x%08x", got, peerA)

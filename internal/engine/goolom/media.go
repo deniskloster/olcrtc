@@ -65,6 +65,7 @@ func (s *Session) handleSdpOffer(offer map[string]any, uid string, sendPub bool)
 		return fmt.Errorf("set local desc: %w", err)
 	}
 
+	logger.Infof("wsdiag: OUT subscriberSdpAnswer pcSeq=%v sdpLen=%d", pcSeq, len(answer.SDP))
 	s.wsMu.Lock()
 	_ = s.ws.WriteJSON(map[string]any{
 		keyUID: uuid.New().String(),
@@ -79,11 +80,12 @@ func (s *Session) handleSdpOffer(offer map[string]any, uid string, sendPub bool)
 
 	if s.onData == nil {
 		if err := s.sendSetSlots(); err != nil {
-			logger.Debugf("setSlots error: %v", err)
+			logger.Infof("wsdiag: setSlots ERROR: %v", err)
 		}
 	}
 
 	if !sendPub {
+		logger.Infof("wsdiag: sendPub=false, skipping publisherSdpOffer")
 		return nil
 	}
 
@@ -97,13 +99,18 @@ func (s *Session) handleSdpOffer(offer map[string]any, uid string, sendPub bool)
 		return fmt.Errorf("set local pub desc: %w", err)
 	}
 
+	tracks := s.publisherTrackDescriptions()
+	logger.Infof("wsdiag: OUT publisherSdpOffer sdpLen=%d trackCount=%d", len(pubOffer.SDP), len(tracks))
+	for i, t := range tracks {
+		logger.Infof("wsdiag:   pubTrack[%d] mid=%v kind=%v label=%v", i, t["mid"], t["kind"], t["label"])
+	}
 	s.wsMu.Lock()
 	_ = s.ws.WriteJSON(map[string]any{
 		keyUID: uuid.New().String(),
 		"publisherSdpOffer": map[string]any{
 			keyPcSeq: 1,
 			"sdp":    pubOffer.SDP,
-			"tracks": s.publisherTrackDescriptions(),
+			"tracks": tracks,
 		},
 	})
 	s.wsMu.Unlock()
@@ -196,6 +203,7 @@ func (s *Session) sendSetSlots() error {
 	for range 8 {
 		slots = append(slots, map[string]int{"width": 1280, "height": 720})
 	}
+	logger.Infof("wsdiag: OUT setSlots slotCount=%d audioSlots=0 selfView=false", len(slots))
 	if err := s.ws.WriteJSON(map[string]any{
 		keyUID: uuid.New().String(),
 		"setSlots": map[string]any{

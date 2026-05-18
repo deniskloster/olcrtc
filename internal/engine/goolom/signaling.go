@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -64,7 +65,7 @@ func (s *Session) handleSignaling(ctx context.Context) {
 		var msg map[string]any
 		if err := s.ws.ReadJSON(&msg); err != nil {
 			if !s.closed.Load() {
-				logger.Debugf("ws read error: %v", err)
+				logger.Infof("wsdiag: ws read error: %v", err)
 				s.queueReconnect()
 			}
 			return
@@ -73,16 +74,19 @@ func (s *Session) handleSignaling(ctx context.Context) {
 		s.updateWSDeadline()
 
 		uid, _ := msg[keyUID].(string)
+		logger.Infof("wsdiag: IN keys=%s uid=%s", msgTopKeys(msg), uid)
 		s.handleMessageEvents(ctx, msg, uid)
 
 		if isConferenceEndMessage(msg) {
+			logger.Infof("wsdiag: conference ENDED uid=%s", uid)
 			s.signalEnded("conference ended")
 			return
 		}
 
 		if offer, ok := msg["subscriberSdpOffer"].(map[string]any); ok {
+			logger.Infof("wsdiag: subscriberSdpOffer from uid=%s sendingPub=%v", uid, !pubSent)
 			if err := s.handleSdpOffer(offer, uid, !pubSent); err != nil {
-				logger.Debugf("sdp offer error: %v", err)
+				logger.Infof("wsdiag: sdp offer ERROR: %v", err)
 				continue
 			}
 			pubSent = true
@@ -90,6 +94,19 @@ func (s *Session) handleSignaling(ctx context.Context) {
 
 		s.handleSignalingResponses(msg, uid)
 	}
+}
+
+// msgTopKeys returns sorted comma-separated top-level keys for a JSON msg.
+func msgTopKeys(m map[string]any) string {
+	if len(m) == 0 {
+		return "(empty)"
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, ",")
 }
 
 func (s *Session) handleMessageEvents(ctx context.Context, msg map[string]any, uid string) {

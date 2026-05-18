@@ -137,7 +137,7 @@ func TestHandleIncomingFrameIgnoresLoopedBackLocalEpoch(t *testing.T) {
 	binary.BigEndian.PutUint32(frame[crcOff:epochHdrLen], epochCRC(tr.bindingToken, tr.localEpoch))
 	copy(frame[epochHdrLen:], []byte{1, 2, 3, 4})
 
-	tr.handleIncomingFrame(frame)
+	tr.handleIncomingFrame(frame, "test")
 
 	if tr.hadPeer.Load() {
 		t.Fatal("self-echo frame must not mark peer as seen")
@@ -168,7 +168,7 @@ func TestHandleIncomingFrameIgnoresForeignBindingToken(t *testing.T) {
 	binary.BigEndian.PutUint32(frame[crcOff:epochHdrLen], epochCRC(otherToken, 999))
 	copy(frame[epochHdrLen:], []byte{1, 2, 3, 4})
 
-	tr.handleIncomingFrame(frame)
+	tr.handleIncomingFrame(frame, "test")
 
 	if tr.hadPeer.Load() {
 		t.Fatal("foreign frame must not mark peer as seen")

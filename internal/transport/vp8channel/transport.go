@@ -107,11 +107,17 @@ type streamTransport struct {
 	localEpoch   uint32
 	peerEpoch    atomic.Uint32
 	hadPeer      atomic.Bool
+	sentFirst    atomic.Bool
 
 	kcp         *kcpRuntime
 	kcpMu       sync.RWMutex
 	reconnectMu sync.Mutex
 	reconnectFn func()
+
+	// loggedDecisions dedupes vp8diag log lines so each (decision, epoch,
+	// trackInfo) tuple logs once. Avoids flood when SFU sends thousands of
+	// frames per second.
+	loggedDecisions sync.Map
 }
 
 // New creates a vp8channel transport backed by a carrier.
@@ -169,6 +175,8 @@ func New(ctx context.Context, cfg transport.Config) (transport.Transport, error)
 		localEpoch:    randomEpoch(),
 	}
 	rememberLocalEpoch(tr.localEpoch)
+	logger.Infof("vp8diag: NEW streamTransport localEpoch=0x%08x bindingToken=0x%08x roomURL=%s",
+		tr.localEpoch, tr.bindingToken, cfg.RoomURL)
 
 	if err := stream.AddTrack(track); err != nil {
 		return nil, fmt.Errorf("attach local video track: %w", err)
@@ -297,6 +305,10 @@ func (p *streamTransport) Send(data []byte) error {
 	p.kcpMu.RUnlock()
 	if rt == nil {
 		return ErrTransportClosed
+	}
+
+	if !p.sentFirst.Swap(true) {
+		logger.Infof("vp8diag: ★ FIRST SEND bytes=%d localEpoch=0x%08x", len(data), p.localEpoch)
 	}
 
 	return rt.send(data)
@@ -451,9 +463,14 @@ func (p *streamTransport) resetKCP() {
 
 func (p *streamTransport) handleRemoteTrack(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
 	if track.Codec().MimeType != webrtc.MimeTypeVP8 {
+		logger.Infof("vp8diag: NON-VP8 track ignored mime=%s ssrc=%d id=%s",
+			track.Codec().MimeType, track.SSRC(), track.ID())
 		go p.drainTrack(track)
 		return
 	}
+
+	logger.Infof("vp8diag: NEW VP8 track ssrc=%d id=%s streamID=%s payload=%d",
+		track.SSRC(), track.ID(), track.StreamID(), track.PayloadType())
 
 	// We don't reset KCP here. Peer restarts are detected by the epoch
 	// header on incoming frames, which works even when the SFU keeps
@@ -527,10 +544,12 @@ func (s *vp8FrameState) processRTPPacket(pkt *rtp.Packet) []byte {
 func (p *streamTransport) readVP8Track(track *webrtc.TrackRemote) {
 	var state vp8FrameState
 	buf := make([]byte, rtpBufSize)
+	trackInfo := fmt.Sprintf("ssrc=%d id=%s", track.SSRC(), track.ID())
 
 	for {
 		n, _, err := track.Read(buf)
 		if err != nil {
+			logger.Infof("vp8diag: track ended %s err=%v", trackInfo, err)
 			return
 		}
 
@@ -544,7 +563,7 @@ func (p *streamTransport) readVP8Track(track *webrtc.TrackRemote) {
 			continue
 		}
 
-		p.handleIncomingFrame(frame)
+		p.handleIncomingFrame(frame, trackInfo)
 	}
 }
 
@@ -556,15 +575,17 @@ func (p *streamTransport) handleFirstPeer(peerEpoch uint32) {
 // handleIncomingFrame parses the epoch header and delivers the KCP payload
 // to the local session. After the first peer's epoch is locked in, frames
 // from any other epoch are silently dropped (see foreign-peer branch below).
-func (p *streamTransport) handleIncomingFrame(frame []byte) {
+func (p *streamTransport) handleIncomingFrame(frame []byte, trackInfo string) {
 	frameToken, peerEpoch, ok := parseEpochHeader(frame)
 	if !ok {
-		logger.Debugf("vp8channel: frame header checksum mismatch")
+		p.logIncomingOnce("bad-checksum", 0, trackInfo,
+			"vp8diag: frame header checksum mismatch track=%s", trackInfo)
 		return
 	}
 	if frameToken != p.bindingToken {
-		logger.Debugf("vp8channel: frame token mismatch got=0x%08x want=0x%08x (foreign client or noise)",
-			frameToken, p.bindingToken)
+		p.logIncomingOnce("foreign-token", uint32(frameToken), trackInfo,
+			"vp8diag: foreign-token got=0x%08x want=0x%08x track=%s",
+			frameToken, p.bindingToken, trackInfo)
 		return
 	}
 	kcpPayload := frame[epochHdrLen:]
@@ -578,11 +599,15 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 	// a few seconds; without this guard the new transport's first-peer lock
 	// latches onto that stale self-echo and rejects real peer frames.
 	if peerEpoch == p.localEpoch || isStaleSelfEcho(peerEpoch) {
-		logger.Debugf("vp8channel: self-echo detected epoch=0x%08x (SFU reflects our own track)", peerEpoch)
+		p.logIncomingOnce("self-echo", peerEpoch, trackInfo,
+			"vp8diag: SELF-ECHO epoch=0x%08x localEpoch=0x%08x track=%s",
+			peerEpoch, p.localEpoch, trackInfo)
 		return
 	}
 
 	if !p.hadPeer.Swap(true) {
+		logger.Infof("vp8diag: ★ FIRST PEER epoch=0x%08x track=%s payload=%dB",
+			peerEpoch, trackInfo, len(kcpPayload))
 		p.handleFirstPeer(peerEpoch)
 	} else if prev := p.peerEpoch.Load(); prev != peerEpoch {
 		// First-peer lock: ignore frames from other WebRTC peers in the same
@@ -592,20 +617,34 @@ func (p *streamTransport) handleIncomingFrame(frame []byte) {
 		//
 		// Legitimate remote restart is detected via smux/KCP keepalive timeout
 		// or link disconnect, not via epoch flapping here.
-		logger.Debugf("vp8channel: ignoring frame from foreign peer epoch=0x%08x (locked to 0x%08x)",
-			peerEpoch, prev)
+		p.logIncomingOnce("foreign-peer", peerEpoch, trackInfo,
+			"vp8diag: FOREIGN PEER epoch=0x%08x (locked to 0x%08x) track=%s",
+			peerEpoch, prev, trackInfo)
 		return
 	}
 
 	if len(kcpPayload) == 0 {
 		return
 	}
+	p.logIncomingOnce("delivered", peerEpoch, trackInfo,
+		"vp8diag: DELIVERED first payload from epoch=0x%08x bytes=%d track=%s",
+		peerEpoch, len(kcpPayload), trackInfo)
 	p.kcpMu.RLock()
 	rt := p.kcp
 	p.kcpMu.RUnlock()
 	if rt != nil {
 		rt.deliver(kcpPayload)
 	}
+}
+
+// logIncomingOnce logs key=(decision, epoch, trackInfo) only on first occurrence.
+// Subsequent occurrences increment a counter that we don't read (just dedup).
+func (p *streamTransport) logIncomingOnce(decision string, epoch uint32, trackInfo, format string, args ...any) {
+	key := decision + ":" + fmt.Sprintf("%08x:%s", epoch, trackInfo)
+	if _, loaded := p.loggedDecisions.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	logger.Infof(format, args...)
 }
 
 /*
