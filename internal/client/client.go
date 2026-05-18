@@ -305,10 +305,16 @@ func resolveDeviceID(deviceID, path string) (string, error) {
 }
 
 // smuxConfig returns the tuned smux config used on both ends.
+//
+// KeepAlive enabled 2026-05-18 — see server-side smuxConfig comment for
+// the ghost-peer rationale. Both ends must agree on the keep-alive setting
+// or smux v2 emits "keep-alive disabled" mismatches; enabling on both
+// keeps the protocol symmetric and lets the client also detect a dead
+// server-side smux (e.g. server crashed without sending FIN through KCP).
 func smuxConfig() *smux.Config {
 	cfg := smux.DefaultConfig()
 	cfg.Version = 2
-	cfg.KeepAliveDisabled = true
+	cfg.KeepAliveDisabled = false
 	cfg.MaxFrameSize = 32768
 	cfg.MaxReceiveBuffer = 16 * 1024 * 1024
 	cfg.MaxStreamBuffer = 1024 * 1024

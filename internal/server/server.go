@@ -241,10 +241,25 @@ func (s *Server) setupResolver() {
 
 // smuxConfig mirrors the client side. Both peers must agree on Version and
 // MaxFrameSize.
+//
+// KeepAlive enabled 2026-05-18: was previously disabled because vp8channel
+// layer was assumed reliable enough that smux didn't need its own liveness
+// pings. That assumption broke on Telemost: when a client tears down its
+// tunnel, its Pion WebRTC peer can keep publishing the last VP8 frames to
+// the SFU for tens of seconds (or the SFU continues echoing buffered video
+// from the dead track). Server's vp8channel sees fresh frames with the
+// locked epoch and never lets the peer-lock idle out — the smux session
+// above thinks the client is alive, the ghost-peer release timer is
+// disarmed (smuxOpened=true), and every new connect from the same phone
+// is rejected as FOREIGN PEER forever.
+//
+// With KeepAlive on, server pings the client every 10 s and closes the
+// session after 60 s of no response. That close cascades into
+// Peer.closeSession → ResetPeerLock → next connect can latch a fresh epoch.
 func smuxConfig() *smux.Config {
 	cfg := smux.DefaultConfig()
 	cfg.Version = 2
-	cfg.KeepAliveDisabled = true
+	cfg.KeepAliveDisabled = false
 	cfg.MaxFrameSize = 32768
 	cfg.MaxReceiveBuffer = 16 * 1024 * 1024
 	cfg.MaxStreamBuffer = 1024 * 1024
