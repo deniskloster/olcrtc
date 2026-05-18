@@ -137,10 +137,19 @@ func RunWithReady(ctx context.Context, cfg Config, onReady func()) error {
 		socksPass: cfg.SOCKSPass,
 	}
 
+	// Defer shutdown BEFORE bringUpLink — bringUpLink stores the link
+	// (and through it pcPub / pcSub created inside Session.Connect) on
+	// c.ln before it attempts the smux handshake. If the handshake
+	// fails (e.g. "read welcome: read hdr: timeout"), c.ln + pcPub +
+	// pcSub stay alive on the SFU, keep ICE-pinging it, and the next
+	// connect attempt sees its frames as a "ghost peer" that locks
+	// the server-side vp8channel. Letting shutdown run on every exit
+	// path closes the whole stack including Pion's peer connections.
+	defer c.shutdown()
+
 	if err := c.bringUpLink(runCtx, cfg, cancel); err != nil {
 		return err
 	}
-	defer c.shutdown()
 
 	lc := net.ListenConfig{}
 	listener, err := lc.Listen(runCtx, "tcp4", cfg.LocalAddr)
