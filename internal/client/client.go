@@ -404,6 +404,15 @@ func resolveDeviceID(deviceID, path string) (string, error) {
 // or smux v2 emits "keep-alive disabled" mismatches; enabling on both
 // keeps the protocol symmetric and lets the client also detect a dead
 // server-side smux (e.g. server crashed without sending FIN through KCP).
+//
+// Phase 8.1 (2026-05-18 follow-up): tightened to KeepAliveInterval=5s
+// (was 10s) and KeepAliveTimeout=90s (was 60s). The combination gives
+// up to 18 ping attempts before declaring death, so transient carrier
+// NAT drops / SFU bandwidth-optimization stalls / KCP RTO bursts no
+// longer trip the timeout — observed in field: 3–5 min idle periods
+// were consistently killing the session with the 10s/60s pair, because
+// when carrier MTS/Tele2 stalled an idle UDP flow, only 6 pings had a
+// chance to land and a few packet losses would push us over the line.
 func smuxConfig() *smux.Config {
 	cfg := smux.DefaultConfig()
 	cfg.Version = 2
@@ -411,8 +420,8 @@ func smuxConfig() *smux.Config {
 	cfg.MaxFrameSize = 32768
 	cfg.MaxReceiveBuffer = 16 * 1024 * 1024
 	cfg.MaxStreamBuffer = 1024 * 1024
-	cfg.KeepAliveInterval = 10 * time.Second
-	cfg.KeepAliveTimeout = 60 * time.Second
+	cfg.KeepAliveInterval = 5 * time.Second
+	cfg.KeepAliveTimeout = 90 * time.Second
 	return cfg
 }
 

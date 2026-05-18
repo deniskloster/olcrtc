@@ -253,9 +253,15 @@ func (s *Server) setupResolver() {
 // disarmed (smuxOpened=true), and every new connect from the same phone
 // is rejected as FOREIGN PEER forever.
 //
-// With KeepAlive on, server pings the client every 10 s and closes the
-// session after 60 s of no response. That close cascades into
+// With KeepAlive on, server pings the client every 5 s and closes the
+// session after 90 s of no response. That close cascades into
 // Peer.closeSession → ResetPeerLock → next connect can latch a fresh epoch.
+//
+// Phase 8.1 (2026-05-18 follow-up): tightened to 5s/90s (was 10s/60s).
+// MUST stay in lock-step with internal/client smuxConfig — both peers
+// have to agree on the ping cadence or smux v2 emits mismatch errors.
+// See the client-side comment for the field tuning rationale (carrier
+// idle UDP drops + SFU stall bursts were tripping the 10s/60s pair).
 func smuxConfig() *smux.Config {
 	cfg := smux.DefaultConfig()
 	cfg.Version = 2
@@ -263,8 +269,8 @@ func smuxConfig() *smux.Config {
 	cfg.MaxFrameSize = 32768
 	cfg.MaxReceiveBuffer = 16 * 1024 * 1024
 	cfg.MaxStreamBuffer = 1024 * 1024
-	cfg.KeepAliveInterval = 10 * time.Second
-	cfg.KeepAliveTimeout = 60 * time.Second
+	cfg.KeepAliveInterval = 5 * time.Second
+	cfg.KeepAliveTimeout = 90 * time.Second
 	return cfg
 }
 
