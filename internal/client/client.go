@@ -549,6 +549,12 @@ func (c *Client) handleSocks5(_ context.Context, conn net.Conn) {
 	sess := c.session
 	c.sessMu.RUnlock()
 	if sess == nil || sess.IsClosed() {
+		// Watchdog (monitorSession) catches sustained death and unwinds
+		// RunWithReady. This path covers the small race window between
+		// session close and watchdog firing — log it so we see how often
+		// it happens, and so the failure mode isn't silent.
+		logger.Warnf("socks5 %s→%s:%d: session unavailable (sess==nil:%v), replying HostUnreachable",
+			conn.RemoteAddr(), targetAddr, targetPort, sess == nil)
 		_, _ = conn.Write(replyHostUnreachable())
 		return
 	}
