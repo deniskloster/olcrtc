@@ -108,6 +108,26 @@ type streamTransport struct {
 	peerEpoch    atomic.Uint32
 	hadPeer      atomic.Bool
 	sentFirst    atomic.Bool
+	// lastPeerFrameUnixNano is updated every time a frame with the locked
+	// peerEpoch is accepted. When a frame with a DIFFERENT epoch arrives
+	// and (now - lastPeerFrameUnixNano) exceeds peerIdleResetThreshold, we
+	// treat the locked peer as gone and accept the new epoch as the next
+	// FIRST PEER. Closes the silent-disconnect gap: phone tearing down ICE
+	// without notifying smux leaves the server with a stale peer-lock until
+	// KCP timeout, which is way too long for human-paced reconnect.
+	lastPeerFrameUnixNano atomic.Int64
+
+	// peerLockedUnixNano is set when handleFirstPeer latches a new lock and
+	// cleared on ResetPeerLock. It anchors the ghost-peer release path: if a
+	// peer holds the lock for ghostPeerHandshakeWindow without an smux
+	// session ever opening above (i.e. the peer is still pumping VP8 frames
+	// but the smux client side is dead / gone), foreign-peer frames force
+	// the lock open even though lastPeerFrameUnixNano is fresh. Without this
+	// the idle-release path never triggers because ghost WebRTC sessions on
+	// Telemost SFU keep sending video for minutes after the real client
+	// tore down its smux/tun stack.
+	peerLockedUnixNano atomic.Int64
+	smuxOpened         atomic.Bool
 
 	kcp         *kcpRuntime
 	kcpMu       sync.RWMutex
@@ -567,9 +587,38 @@ func (p *streamTransport) readVP8Track(track *webrtc.TrackRemote) {
 	}
 }
 
+// peerIdleResetThreshold: if no frame from the locked peer arrives for this
+// long AND a foreign epoch shows up, the lock is released. 5 s is short
+// enough to make phone disconnect → reconnect feel snappy, long enough that
+// Telemost ghost-observers (which interleave at ~250 ms with the real peer)
+// can't slip past.
+const peerIdleResetThreshold = 5 * time.Second
+
+// ghostPeerHandshakeWindow: maximum time a locked peer is allowed to keep
+// the lock without an smux session ever opening on top of it. When a real
+// client disconnects, its WebRTC peer on Telemost SFU may live for tens of
+// seconds longer, pumping us frames the entire time — so the idle-release
+// path never fires. The new reconnecting client then competes with that
+// ghost and loses (FOREIGN PEER drops). This window force-releases the lock
+// once it expires, regardless of how recent the locked peer's frames are.
+// 30 s is short enough that reconnect feels acceptable, long enough to let
+// the legitimate handshake complete (typically 1–3 s once the peer is real).
+const ghostPeerHandshakeWindow = 30 * time.Second
+
 func (p *streamTransport) handleFirstPeer(peerEpoch uint32) {
+	now := time.Now().UnixNano()
 	p.peerEpoch.Store(peerEpoch)
+	p.lastPeerFrameUnixNano.Store(now)
+	p.peerLockedUnixNano.Store(now)
+	p.smuxOpened.Store(false)
 	logger.Infof("vp8channel: peer first seen epoch=0x%08x", peerEpoch)
+}
+
+// MarkSessionOpened is called by the upper layer once the smux session has
+// completed its handshake. Once set, the ghost-peer release path stops
+// considering this lock a candidate for force-release.
+func (p *streamTransport) MarkSessionOpened() {
+	p.smuxOpened.Store(true)
 }
 
 // ResetPeerLock clears the first-peer lock so the next non-self epoch can
@@ -588,6 +637,9 @@ func (p *streamTransport) ResetPeerLock() {
 	p.hadPeer.Store(false)
 	p.peerEpoch.Store(0)
 	p.sentFirst.Store(false)
+	p.lastPeerFrameUnixNano.Store(0)
+	p.peerLockedUnixNano.Store(0)
+	p.smuxOpened.Store(false)
 	// Reset dedup so the next first-peer / first-send is logged again.
 	p.loggedDecisions = sync.Map{}
 	if wasPeer {
@@ -638,13 +690,63 @@ func (p *streamTransport) handleIncomingFrame(frame []byte, trackInfo string) {
 		// rooms). Without this lock, alternating frames from multiple peers
 		// toggle peerEpoch → resetKCP → reconnect → storm.
 		//
-		// Legitimate remote restart is detected via smux/KCP keepalive timeout
-		// or link disconnect, not via epoch flapping here.
-		p.logIncomingOnce("foreign-peer", peerEpoch, trackInfo,
-			"vp8diag: FOREIGN PEER epoch=0x%08x (locked to 0x%08x) track=%s",
-			peerEpoch, prev, trackInfo)
-		return
+		// EXCEPT: if the locked peer has been silent for peerIdleResetThreshold,
+		// the foreign epoch is treated as a legitimate reconnect. Client
+		// disconnect is silent at the smux level (ICE just dies), so without
+		// this idle-based release the lock would stay pinned until KCP
+		// timeout and every reconnect within that window would be dropped.
+		nowNano := time.Now().UnixNano()
+		lastNano := p.lastPeerFrameUnixNano.Load()
+		idle := time.Duration(nowNano - lastNano)
+		lockedAt := p.peerLockedUnixNano.Load()
+		lockedAge := time.Duration(nowNano - lockedAt)
+		// Two independent release conditions:
+		//   1. Idle — locked peer stopped sending (clean client disconnect).
+		//   2. Ghost — locked peer keeps pumping frames but no smux handshake
+		//      ever completed on top. Smux/tun client is dead; the WebRTC
+		//      track is a Telemost-side zombie.
+		staleIdle := lastNano > 0 && idle >= peerIdleResetThreshold
+		ghostLock := lockedAt > 0 && lockedAge >= ghostPeerHandshakeWindow && !p.smuxOpened.Load()
+		if staleIdle || ghostLock {
+			reason := "stale-idle"
+			if ghostLock && !staleIdle {
+				reason = "ghost-no-handshake"
+			}
+			logger.Infof("vp8diag: peer-lock RELEASE (%s) epoch=0x%08x idle=%s locked-for=%s — accepting new peer epoch=0x%08x",
+				reason, prev, idle.Round(time.Millisecond), lockedAge.Round(time.Millisecond), peerEpoch)
+			// Reinstall the lock on the new epoch. Drop dedup so the next
+			// FIRST/FOREIGN/DELIVERED for this peer logs once.
+			p.loggedDecisions = sync.Map{}
+			p.peerEpoch.Store(peerEpoch)
+			p.lastPeerFrameUnixNano.Store(nowNano)
+			p.peerLockedUnixNano.Store(nowNano)
+			p.smuxOpened.Store(false)
+			logger.Infof("vp8diag: ★ FIRST PEER epoch=0x%08x track=%s payload=%dB (after stale-release)",
+				peerEpoch, trackInfo, len(kcpPayload))
+			// Reset KCP so the new client's fresh KCP handshake is matched
+			// by a fresh server-side state. localEpoch intentionally not
+			// bumped (would echo-storm with the SFU — see resetKCP comments).
+			p.resetKCP()
+			// Trigger the link's reconnect callback (server.Peer wires this
+			// to handleReconnect → reinstallSession). Without this, the old
+			// smux server keeps living above the dead KCP and never accepts
+			// the reconnecting client's smux hello, so the phone's handshake
+			// hits "read welcome: timeout".
+			p.reconnectMu.Lock()
+			cb := p.reconnectFn
+			p.reconnectMu.Unlock()
+			if cb != nil {
+				go cb()
+			}
+		} else {
+			p.logIncomingOnce("foreign-peer", peerEpoch, trackInfo,
+				"vp8diag: FOREIGN PEER epoch=0x%08x (locked to 0x%08x, idle=%s) track=%s",
+				peerEpoch, prev, idle.Round(time.Millisecond), trackInfo)
+			return
+		}
 	}
+	// Frame from the locked peer — bump the freshness timestamp.
+	p.lastPeerFrameUnixNano.Store(time.Now().UnixNano())
 
 	if len(kcpPayload) == 0 {
 		return

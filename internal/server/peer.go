@@ -260,6 +260,14 @@ func (p *Peer) acceptHandshake(ctx context.Context, sess *smux.Session) bool {
 	p.deviceID = hello.DeviceID
 	p.sessionID = sid
 	p.mu.Unlock()
+	// Tell the link's vp8channel that an smux session has completed its
+	// handshake on top of the locked peer-epoch. This disarms the ghost-peer
+	// force-release timer so a long-lived legitimate session is not torn
+	// down by it. Optional interface — no-op for links/transports that
+	// don't implement MarkSessionOpened.
+	if m, ok := p.Link.(interface{ MarkSessionOpened() }); ok {
+		m.MarkSessionOpened()
+	}
 	p.parent.onOpen(sid, hello.DeviceID, hello.Claims)
 	logger.Infof("peer %s: session %s opened (device=%s)", p.ClientID, sid, hello.DeviceID)
 	// Park the control stream in a goroutine.

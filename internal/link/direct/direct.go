@@ -89,3 +89,12 @@ func (d *directLink) ResetPeerLock() {
 		r.ResetPeerLock()
 	}
 }
+
+// MarkSessionOpened forwards the "smux handshake complete" signal to the
+// underlying transport (vp8channel) so its ghost-peer release timer can
+// disarm itself. Optional-interface forwarding.
+func (d *directLink) MarkSessionOpened() {
+	if m, ok := d.transport.(interface{ MarkSessionOpened() }); ok {
+		m.MarkSessionOpened()
+	}
+}
