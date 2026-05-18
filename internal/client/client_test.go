@@ -606,6 +606,54 @@ func TestMonitorSessionLeavesHealthySessionAlone(t *testing.T) {
 	<-done
 }
 
+func TestMonitorSessionCancelsOnStreamFailureFlood(t *testing.T) {
+	// Healthy session (IsClosed stays false), but streamFailures crosses
+	// the limit — server-side handleStream is stalled. Watchdog must
+	// still cancel.
+	withFastMonitor(t, 5*time.Millisecond, 3)
+	origLim := streamFailureLimit
+	t.Cleanup(func() { streamFailureLimit = origLim })
+	streamFailureLimit = 5
+
+	a, b := net.Pipe()
+	defer func() { _ = a.Close(); _ = b.Close() }()
+	serverSess, err := smux.Server(a, smuxConfig())
+	if err != nil {
+		t.Fatalf("smux.Server() error = %v", err)
+	}
+	defer func() { _ = serverSess.Close() }()
+	clientSess, err := smux.Client(b, smuxConfig())
+	if err != nil {
+		t.Fatalf("smux.Client() error = %v", err)
+	}
+	defer func() { _ = clientSess.Close() }()
+
+	c := &Client{}
+	c.sessMu.Lock()
+	c.session = clientSess
+	c.sessMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		c.monitorSession(ctx, cancel)
+		close(done)
+	}()
+
+	// Sustain a flood of stream failures past the limit.
+	for i := int32(0); i < streamFailureLimit+2; i++ {
+		c.streamFailures.Add(1)
+	}
+
+	select {
+	case <-ctx.Done():
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("watchdog did not cancel on stream-failure flood")
+	}
+	<-done
+}
+
 func TestMonitorSessionToleratesTransientReconnect(t *testing.T) {
 	// Threshold of 6 ticks @ 5ms = 30ms. We blank the session for 10ms
 	// (well below the threshold) to mimic handleReconnect's nil window,

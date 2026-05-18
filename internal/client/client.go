@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -66,6 +67,13 @@ type Client struct {
 	// (so the upstream host service learns the tunnel died) vs nil
 	// (clean shutdown via parent ctx). Empty string means "no death".
 	deathReason sync.Map // single key "reason" -> string
+	// streamFailures counts consecutive sid failures since the last
+	// success. Reset by tunnel() on a clean io.Copy return; bumped on
+	// every sendConnectRequest error. monitorSession trips when this
+	// exceeds streamFailureThreshold — catches the "smux session is
+	// technically alive (IsClosed=false) but server-side handleStream
+	// is stalled" zombie state that the IsClosed-only watchdog misses.
+	streamFailures atomic.Int32
 }
 
 // Config holds runtime configuration for [Run] and [RunWithReady].
@@ -199,9 +207,18 @@ var ErrTunnelDied = errors.New("tunnel died")
 // nils c.session while it rebuilds smux (up to 5 attempts × 300ms),
 // so the threshold gives that path room to complete. Variables so
 // tests can shorten them.
+//
+// streamFailureLimit triggers the watchdog when N consecutive sid
+// failures have piled up without a single success — this catches the
+// "smux session technically alive, server-side handleStream stalled"
+// zombie that IsClosed-only detection misses. 12 sids is enough to
+// be confident it's not just one slow target / one packet-loss burst,
+// and small enough that the user feels a hiccup, not a complete
+// outage.
 var (
 	sessionMonitorInterval  = 2 * time.Second
 	sessionMonitorThreshold = 3
+	streamFailureLimit      = int32(12)
 )
 
 // monitorSession watches c.session for unexpected death. handleReconnect
@@ -249,6 +266,26 @@ func (c *Client) monitorSession(ctx context.Context, cancel context.CancelFunc) 
 				}
 			} else {
 				broken = 0
+			}
+
+			// Stream-level health: when the smux session is technically
+			// alive (passes IsClosed=false) but server-side handleStream
+			// is stalled — observed when tun2socks fires a burst of 30+
+			// fresh smux streams and the server's KCP/vp8channel
+			// flow-control wedges — every sid times out waiting 15s for
+			// the connect-ACK and bumps streamFailures. A clean tunnel()
+			// success resets the counter to 0, so this only trips on
+			// sustained failure. Worth a try-anew via the same
+			// cancel→shutdown→re-alloc path that closed-session triggers.
+			if failures := c.streamFailures.Load(); failures >= streamFailureLimit {
+				reason := fmt.Sprintf(
+					"%d consecutive stream ACK failures (session alive but stalled)",
+					failures,
+				)
+				logger.Warnf("client: %s — unwinding RunWithReady", reason)
+				c.deathReason.Store("reason", reason)
+				cancel()
+				return
 			}
 		}
 	}
@@ -609,9 +646,15 @@ func (c *Client) tunnel(conn net.Conn, sess *smux.Session, targetAddr string, ta
 
 	if err := c.sendConnectRequest(stream, targetAddr, targetPort); err != nil {
 		logger.Warnf("sid=%d connect failed: %v", stream.ID(), err)
+		c.streamFailures.Add(1)
 		_, _ = conn.Write(replyHostUnreachable())
 		return
 	}
+
+	// Server ACKed. Any prior streak of failures was transient — clear it
+	// so the streamFailures watchdog doesn't fire on a tunnel that's
+	// otherwise serving real traffic.
+	c.streamFailures.Store(0)
 
 	if _, err := conn.Write(replySuccess()); err != nil {
 		return
