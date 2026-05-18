@@ -39,7 +39,15 @@ const MaxMessageSize = 64 * 1024
 
 // DefaultTimeout bounds how long either side will wait for the peer's reply
 // before bailing out.
-const DefaultTimeout = 15 * time.Second
+//
+// Phase 8.1 #6 (2026-05-18): bumped 15s → 45s. Live observation on Galaxy
+// S20 Ultra + Telemost: after a reconnect, the SFU sometimes takes 10-20s
+// to start forwarding the server-side VP8 track to the new subscriber peer.
+// Only audio track arrives in the first few seconds; video shows up later.
+// With 15s, the smux handshake (which rides over vp8channel) timed out
+// before video arrived → "handshake client: read welcome: read hdr: timeout".
+// 45s gives the SFU ample room to forward the video track before we bail.
+const DefaultTimeout = 45 * time.Second
 
 // MsgType labels each protocol message.
 type MsgType string
